@@ -19,6 +19,20 @@
 # - If you want true 1024 quality in real usage, export a separate 1024 PNG too.
 #
 # Updated for: 8..1024 sizes, safer out paths, better ICO save behavior, clearer diagnostics.
+#
+# NEW (Progress callbacks):
+# - scan_icon_images_and_convert() now supports progress_cb per-image
+# - convert_many() supports progress_cb per-image
+#   Signature: progress_cb(phase: str, index: int, total: int, path: Optional[Path]) -> None
+#
+#   phase values (by convention):
+#     - "normalize"   (0/1 markers)
+#     - "orphans"     (0/1 markers)
+#     - "scan"        (enumerating / filtering)
+#     - "convert"     (per-image conversion)
+#     - "done"        (0/1 markers)
+#
+# This makes the UI progress bar non-cosmetic without rewriting the engine.
 
 from __future__ import annotations
 
@@ -61,13 +75,10 @@ __all__ = [
 # Standard paths & constants
 # =========================
 
-# Include SVG; rasterized via CairoSVG inside _load_image_any().
 IMAGE_EXTS: set[str] = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif", ".svg"}
 
-# UI default sizes (still useful for manual conversions).
 DEFAULT_SIZES: List[int] = [16, 24, 32, 48, 64, 128, 256]
 
-# "Full" range (8..1024 step 8). Note: Windows shell mostly uses <=256 in practice.
 AUTO_FULL_SIZES: List[int] = list(range(8, 1025, 8))
 
 ICONER_ROOT = Path.home() / "Desktop" / "Iconer"
@@ -79,13 +90,14 @@ for _d in (ICONER_ROOT, ICON_IMAGES_DIR, ICONS_DIR):
 
 DEFAULT_OUTPUT_DIR = str(ICONS_DIR)
 
-# Content scale controls how much of the square canvas the artwork occupies after padding.
-# Lower number => bigger margins.
 PADDING_PRESETS = {
-    "tight": 0.96,      # minimal margin
-    "balanced": 0.88,   # typical desktop icon margins
-    "extra": 0.80,      # thick margin
+    "tight": 0.96,
+    "balanced": 0.88,
+    "extra": 0.80,
 }
+
+# Progress callback type
+ProgressCB = Callable[[str, int, int, Optional[Path]], None]
 
 
 # =========================
@@ -206,8 +218,6 @@ def _rasterize_svg_to_rgba(svg_path: Path) -> Image.Image:
     if cairosvg is None:
         raise RuntimeError(err or "CairoSVG not available")
 
-    # Render SVG to PNG bytes in-memory; then open with Pillow.
-    # CairoSVG chooses a default output size if SVG lacks explicit dimensions.
     png_bytes = cairosvg.svg2png(url=str(svg_path))
     im = Image.open(BytesIO(png_bytes)).convert("RGBA")
     return im
@@ -218,9 +228,6 @@ def _rasterize_svg_to_rgba(svg_path: Path) -> Image.Image:
 # =========================
 
 def _autocrop_alpha(im: Image.Image) -> Image.Image:
-    """
-    Crop transparent borders based on alpha channel.
-    """
     if im.mode != "RGBA":
         im = im.convert("RGBA")
     alpha = im.split()[-1]
@@ -231,10 +238,6 @@ def _autocrop_alpha(im: Image.Image) -> Image.Image:
 
 
 def _pad_to_square_rgba(im: Image.Image, content_scale: float) -> Image.Image:
-    """
-    Center the image into a square RGBA canvas.
-    content_scale controls how much of the square the artwork occupies.
-    """
     if im.mode != "RGBA":
         im = im.convert("RGBA")
 
@@ -244,8 +247,6 @@ def _pad_to_square_rgba(im: Image.Image, content_scale: float) -> Image.Image:
 
     max_side = max(w, h)
 
-    # If content_scale is 0.88, the content should be ~88% of the canvas.
-    # canvas_side = max_side / content_scale
     content_scale = max(0.01, float(content_scale))
     side = int(math.ceil(max_side / content_scale))
     side = max(side, 1)
@@ -258,10 +259,6 @@ def _pad_to_square_rgba(im: Image.Image, content_scale: float) -> Image.Image:
 
 
 def _load_image_any(path: Path) -> Image.Image:
-    """
-    Load raster images with Pillow.
-    Load SVG via CairoSVG rasterization.
-    """
     suf = path.suffix.lower()
     if suf == ".svg":
         return _rasterize_svg_to_rgba(path)
@@ -269,14 +266,9 @@ def _load_image_any(path: Path) -> Image.Image:
 
 
 def _normalize_sizes(sizes: Optional[Sequence[int]]) -> List[int]:
-    """
-    - removes invalid
-    - de-dupes
-    - sorts ascending
-    """
     if not sizes:
         return []
-    norm = []
+    norm: List[int] = []
     seen = set()
     for s in sizes:
         try:
@@ -299,17 +291,8 @@ def _resolve_output_target(
     src: Path,
     suffix: str = "",
 ) -> Tuple[Path, Path]:
-    """
-    Defensive resolver:
-
-    - If caller passes a directory: out_dir = that directory, out_path = out_dir/<stem><suffix>.ico
-    - If caller passes a path ending in ".ico": treat as explicit out_path, out_dir = parent
-
-    Returns: (out_dir, out_path)
-    """
     p = Path(outdir_or_file)
 
-    # Treat "*.ico" as explicit file path (prevents folder named "Alion.ico").
     if p.suffix.lower() == ".ico":
         out_dir = p.parent
         out_name = p.name
@@ -336,15 +319,6 @@ def make_ico(
     padding_mode: str = "balanced",
     logfn: Callable[[str], None] | None = None,
 ) -> Tuple[bool, str]:
-    """
-    Create a multi-size .ico from src into outdir.
-
-    Returns: (ok, message)
-
-    Key behavior for "16x16 no matter what":
-    - We always save the ICO from a LARGE base image (largest requested size).
-      Pillow then embeds the requested sizes from that base.
-    """
     src = Path(src)
     if not src.exists() or not src.is_file():
         return False, f"ERR: Source does not exist: {src}"
@@ -366,7 +340,6 @@ def make_ico(
     padding_mode = (padding_mode or "balanced").strip().lower()
     content_scale = PADDING_PRESETS.get(padding_mode, PADDING_PRESETS["balanced"])
 
-    # Load image (SVG supported)
     try:
         im = _load_image_any(src)
     except RuntimeError as e:
@@ -376,25 +349,20 @@ def make_ico(
     except Exception as e:
         return False, f"ERR: Failed to open {src.name}: {e}"
 
-    # Optional autocrop based on alpha
     if autocrop:
         try:
             im = _autocrop_alpha(im)
         except Exception:
             pass
 
-    # Alpha control
     if keep_alpha:
         im = im.convert("RGBA")
     else:
-        # Flatten: composite on transparent then convert; (rare use-case)
         im = im.convert("RGBA").convert("RGB")
 
-    # Pad to square
     if keep_alpha:
         base_canvas = _pad_to_square_rgba(im, content_scale=content_scale)
     else:
-        # RGB pad with black background
         w, h = im.size
         max_side = max(w, h)
         side = int(math.ceil(max_side / max(0.01, float(content_scale))))
@@ -405,9 +373,6 @@ def make_ico(
         canvas.paste(im, (x, y))
         base_canvas = canvas
 
-    # IMPORTANT:
-    # Save from the largest requested size as the base image.
-    # This avoids the common "base is tiny -> ICO seems stuck at 16x16" behavior.
     largest = max(sizes_to_use)
 
     try:
@@ -416,8 +381,6 @@ def make_ico(
         else:
             base = base_canvas.resize((largest, largest), Image.LANCZOS).convert("RGB")
 
-        # Pillow writes ICO and embeds requested sizes.
-        # Even if sizes > 256 are included, Windows may ignore them; still embedded if Pillow supports.
         base.save(out_path, format="ICO", sizes=[(s, s) for s in sizes_to_use])
 
         msg = f"OK: {src.name} -> {out_path.name} sizes={sizes_to_use[0]}..{sizes_to_use[-1]} ({len(sizes_to_use)} frames)"
@@ -434,10 +397,12 @@ def make_ico(
 
 def normalize_icon_images_library(logfn: Callable[[str], None] | None = None) -> int:
     """
-    Flatten any images placed in subfolders under Icon Images into root with
-    a folder-prefixed filename, to preserve uniqueness.
+    Flatten nested files into ICON_IMAGES_DIR root WITHOUT creating duplicates.
 
-    Returns: number of files moved.
+    Rule:
+      - If the target filename already exists in ICON_IMAGES_DIR, DO NOT move and DO NOT rename.
+      - Never create ' (2)' variants.
+      - Leave the conflicting file where it is (and log).
     """
     if not ICON_IMAGES_DIR.exists():
         return 0
@@ -447,11 +412,15 @@ def normalize_icon_images_library(logfn: Callable[[str], None] | None = None) ->
         if not _is_image_file(p):
             continue
         if p.parent == ICON_IMAGES_DIR:
-            continue  # already root
+            continue
 
         new_name = closest_folder_named_filename(p)
         dst = ICON_IMAGES_DIR / new_name
-        dst = unique_path(dst)
+
+        if dst.exists():
+            if logfn:
+                logfn(f"Normalize: SKIP (name collision): {p} -> {dst.name}")
+            continue
 
         try:
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -459,16 +428,19 @@ def normalize_icon_images_library(logfn: Callable[[str], None] | None = None) ->
             moved += 1
         except Exception as e:
             if logfn:
-                logfn(f"Normalize: failed to move {p} -> {dst}: {e}")
+                logfn(f"Normalize: FAILED {p} -> {dst}: {e}")
 
     if moved and logfn:
         logfn(f"Normalize: moved {moved} file(s) into root.")
     return moved
 
-
 def mirror_copy_to_icon_images(src: Path, logfn: Callable[[str], None] | None = None) -> Optional[Path]:
     """
-    Copy an input image into Icon Images root.
+    COPY src into ICON_IMAGES_DIR (canonical library) without ever creating duplicates.
+
+    Rule:
+      - If the destination name already exists in ICON_IMAGES_DIR, SKIP the copy.
+      - Never create ' (2)', ' (3)' variants.
     """
     src = Path(src)
     if not src.exists() or not src.is_file():
@@ -477,16 +449,21 @@ def mirror_copy_to_icon_images(src: Path, logfn: Callable[[str], None] | None = 
     ICON_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
     dst = ICON_IMAGES_DIR / sanitize_piece(src.name)
-    dst = unique_path(dst)
+
+    if dst.exists():
+        if logfn:
+            logfn(f"Mirror: SKIP (already exists): {dst.name}")
+        return dst  # treat as success: the library already has it
 
     try:
         shutil.copy2(src, dst)
+        if logfn:
+            logfn(f"Mirror: COPIED {src.name} -> {dst.name}")
         return dst
     except Exception as e:
         if logfn:
-            logfn(f"Mirror copy failed: {src} -> {dst}: {e}")
+            logfn(f"Mirror: FAILED {src} -> {dst}: {e}")
         return None
-
 
 # =========================
 # Orphan cleanup
@@ -500,18 +477,6 @@ def remove_orphan_icons(
     action: str = "delete",
     logfn: Callable[[str], None] | None = None,
 ) -> int:
-    """
-    Delete or quarantine .ico files that no longer have a corresponding source image.
-
-    Matching rule:
-      - Source images are root-level in images_dir (because normalization flattens into root).
-      - For each icon <stem>.ico, corresponding image is any file in images_dir
-        whose stem matches <stem> (after removing optional suffix from icon stem).
-
-    action:
-      - "delete": remove orphan icons
-      - "quarantine": move orphans into icons_dir / "_Orphans"
-    """
     action = (action or "").strip().lower()
     if action not in {"delete", "quarantine"}:
         action = "delete"
@@ -524,7 +489,6 @@ def remove_orphan_icons(
     except Exception:
         return 0
 
-    # Source stems (root-only on purpose)
     src_stems: set[str] = set()
     try:
         for img in images_dir.iterdir():
@@ -540,7 +504,6 @@ def remove_orphan_icons(
         try:
             stem = ico.stem
 
-            # If suffix is used, manage only icons that end with it (avoid touching unrelated icons).
             if suffix:
                 if not stem.endswith(suffix):
                     continue
@@ -549,7 +512,7 @@ def remove_orphan_icons(
                 base_stem = stem
 
             if base_stem in src_stems:
-                continue  # has matching image
+                continue
 
             if action == "quarantine":
                 orphan_dir.mkdir(parents=True, exist_ok=True)
@@ -575,9 +538,6 @@ def remove_orphan_icons(
 # =========================
 
 def list_missing_icon_tasks(images_dir: Path, outdir: Path, suffix: str = "") -> List[Path]:
-    """
-    Return root-level image paths that do not yet have a corresponding .ico in outdir.
-    """
     images_dir = Path(images_dir)
     outdir = Path(outdir)
 
@@ -610,25 +570,52 @@ def convert_many(
     padding_mode: str = "balanced",
     suffix: str = "",
     logfn: Callable[[str], None] | None = None,
+    progress_cb: ProgressCB | None = None,
+    progress_phase: str = "convert",
+    skip_if_ico_exists: bool = False,
 ) -> Tuple[int, int, int]:
     """
     Convert multiple images to ICO.
 
     Returns: (scanned, converted, errors)
+
+    skip_if_ico_exists:
+      - If True and the target .ico already exists, SKIP conversion for that image.
+      - This is stronger than overwrite=False and is intended for maintenance runs.
     """
+    imgs: List[Path] = []
+    for img in images:
+        p = Path(img)
+        if _is_image_file(p):
+            imgs.append(p)
+
+    total = len(imgs)
     scanned = 0
     converted = 0
     errors = 0
 
-    for img in images:
-        img = Path(img)
-        if not _is_image_file(img):
-            continue
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
 
+    for idx, img in enumerate(imgs, start=1):
         scanned += 1
+        if progress_cb:
+            try:
+                progress_cb(progress_phase, idx, total, img)
+            except Exception:
+                pass
+
+        # Hard skip rule for maintenance: if ico exists, do nothing
+        if skip_if_ico_exists:
+            ico_path = outdir / f"{img.stem}{suffix}.ico"
+            if ico_path.exists():
+                if logfn:
+                    logfn(f"SKIP: {img.name} (icon exists: {ico_path.name})")
+                continue
+
         ok, msg = make_ico(
             img,
-            Path(outdir),
+            outdir,
             sizes=sizes,
             overwrite=overwrite,
             keep_alpha=keep_alpha,
@@ -638,7 +625,6 @@ def convert_many(
             logfn=logfn,
         )
         if ok:
-            # "SKIP" is still ok, but not "converted"
             if msg.startswith("OK:"):
                 converted += 1
         else:
@@ -647,6 +633,7 @@ def convert_many(
                 logfn(msg)
 
     return scanned, converted, errors
+
 
 
 @dataclass(frozen=True)
@@ -669,20 +656,41 @@ def scan_icon_images_and_convert(
     orphan_action: str = "delete",
     suffix: str = "",
     logfn: Callable[[str], None] | None = None,
+    progress_cb: ProgressCB | None = None,
 ) -> ScanReport:
     """
-    High-level "library scan" used by tray/UI workflows:
+    High-level "library scan":
 
     1) Normalize Icon Images library (flatten subfolders into root).
     2) Remove orphan .ico in Icons folder (rename-safe).
     3) Convert each root-level image into Icons/<stem>.ico (multi-size).
 
-    Returns ScanReport.
+    Progress:
+      - normalize/orphans as 0/1 markers
+      - convert is per-image real progress
     """
+    if progress_cb:
+        try:
+            progress_cb("normalize", 0, 1, None)
+        except Exception:
+            pass
+
     normalized_moves = normalize_icon_images_library(logfn=logfn)
+
+    if progress_cb:
+        try:
+            progress_cb("normalize", 1, 1, None)
+        except Exception:
+            pass
 
     orphan_removed = 0
     if remove_orphans:
+        if progress_cb:
+            try:
+                progress_cb("orphans", 0, 1, None)
+            except Exception:
+                pass
+
         orphan_removed = remove_orphan_icons(
             images_dir=ICON_IMAGES_DIR,
             icons_dir=ICONS_DIR,
@@ -691,8 +699,27 @@ def scan_icon_images_and_convert(
             logfn=logfn,
         )
 
+        if progress_cb:
+            try:
+                progress_cb("orphans", 1, 1, None)
+            except Exception:
+                pass
+
     # Convert root-level library images
+    if progress_cb:
+        try:
+            progress_cb("scan", 0, 1, None)
+        except Exception:
+            pass
+
     images = [p for p in ICON_IMAGES_DIR.iterdir() if _is_image_file(p)]
+
+    if progress_cb:
+        try:
+            progress_cb("scan", 1, 1, None)
+        except Exception:
+            pass
+
     scanned, converted, errors = convert_many(
         images,
         ICONS_DIR,
@@ -703,6 +730,9 @@ def scan_icon_images_and_convert(
         padding_mode=padding_mode,
         suffix=suffix,
         logfn=logfn,
+        progress_cb=progress_cb,
+        progress_phase="convert",
+        skip_if_ico_exists=True,  # <-- ENFORCE: if ico exists, skip
     )
 
     if logfn:
@@ -710,6 +740,12 @@ def scan_icon_images_and_convert(
             f"Scan done. scanned={scanned} converted={converted} errors={errors} "
             f"orphan_removed={orphan_removed} normalized_moves={normalized_moves}"
         )
+
+    if progress_cb:
+        try:
+            progress_cb("done", 1, 1, None)
+        except Exception:
+            pass
 
     return ScanReport(
         scanned=scanned,
@@ -754,6 +790,7 @@ def _cli() -> int:
             imgs = find_images(p, recursive=True)
         else:
             imgs = []
+
         scanned, converted, errors = convert_many(
             imgs,
             outdir,
@@ -764,6 +801,7 @@ def _cli() -> int:
             padding_mode=str(ns.padding),
             suffix=str(ns.suffix),
             logfn=_print,
+            progress_cb=None,
         )
 
         if ns.remove_orphans:
@@ -780,7 +818,6 @@ def _cli() -> int:
         _print(f"Done. scanned={scanned} converted={converted} errors={errors}")
         return 0 if errors == 0 else 2
 
-    # Default: scan library
     report = scan_icon_images_and_convert(
         sizes=sizes,
         overwrite=bool(ns.overwrite),
@@ -790,6 +827,7 @@ def _cli() -> int:
         orphan_action="quarantine" if ns.quarantine_orphans else "delete",
         suffix=str(ns.suffix),
         logfn=_print,
+        progress_cb=None,
     )
     return 0 if report.errors == 0 else 2
 

@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List
 
+import self
 from PySide6 import QtCore, QtGui, QtWidgets, QtNetwork
 
 import Gen2 as eng
@@ -153,10 +154,14 @@ def _gather_images(input_path: Path, recursive: bool) -> list[Path]:
     return []
 
 
+
+
+
 class CardFrame(QtWidgets.QFrame):
     def __init__(self, title: str = "", parent=None):
         super().__init__(parent)
         self.setObjectName("Card")
+
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(12, 12, 12, 12)
         lay.setSpacing(8)
@@ -174,6 +179,8 @@ class CardFrame(QtWidgets.QFrame):
 
     def body_layout(self) -> QtWidgets.QVBoxLayout:
         return self.layout()  # type: ignore[return-value]
+
+
 
 
 class DropLineEdit(QtWidgets.QLineEdit):
@@ -492,10 +499,58 @@ class LogLine:
     text: str
     level: str = "INFO"  # INFO/WARN/ERR
 
+def preset_sizes(preset: str) -> list[int]:
+    """
+    Presets:
+      16–1024, 16–512, 16–256, …, 16–16
+    Returns a deterministic list of common icon sizes.
+    """
+    preset = (preset or "").strip()
+
+    # Extract the max after the dash, default to 256 if parsing fails
+    try:
+        max_size = int(preset.split("–", 1)[1])
+    except Exception:
+        max_size = 256
+
+    # Standard icon ladder (you accepted these endpoints)
+    ladder = [16, 24, 32, 48, 64, 96, 128, 256, 512, 1024]
+
+    # Keep only <= max_size, but always include 16
+    out = [s for s in ladder if s <= max_size]
+    if 16 not in out:
+        out.insert(0, 16)
+    return out
+
+def choose_library_root(parent) -> Path | None:
+    p = QtWidgets.QFileDialog.getExistingDirectory(
+        parent,
+        "Choose IconMaker Library Location",
+        QtCore.QDir.homePath(),
+    )
+    return Path(p) if p else None
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
+
+        # --- maintenance / watcher state ---
+        self._maint_busy = False
+        self._maint_pending_reason = None
+
+        self._settings = QtCore.QSettings(APP_ORG, APP_NAME)
+
+        self._fs_watcher = QtCore.QFileSystemWatcher(self)
+        self._fs_watcher.directoryChanged.connect(self._on_icon_images_fs_event)
+        self._fs_watcher.fileChanged.connect(self._on_icon_images_fs_event)
+
+        self._fs_debounce = QtCore.QTimer(self)
+        self._fs_debounce.setSingleShot(True)
+        self._fs_debounce.setInterval(400)
+        self._fs_debounce.timeout.connect(lambda: self._maintenance_request("fs-change"))
+
+        # ---------------- Settings ----------------
+        self._settings = QtCore.QSettings(APP_ORG, APP_NAME)
 
         self._app_icon = get_app_icon()
         self.setWindowIcon(self._app_icon)
@@ -507,37 +562,77 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log_buffer: list[LogLine] = []
         self._log_flush_timer = QtCore.QTimer(self)
         self._log_flush_timer.setInterval(80)
-        self._log_flush_timer.timeout.connect(self._flush_log)  # type: ignore[arg-type]
+        self._log_flush_timer.timeout.connect(self._flush_log)
         self._log_flush_timer.start()
 
         self._cancel_requested = False
 
-        # --- auto maintenance (internal scan) ---
-        self._maint_busy = False
-        self._maint_pending_reason: Optional[str] = None
-
-        self._fs_watcher = QtCore.QFileSystemWatcher(self)
-        self._fs_watcher.directoryChanged.connect(self._on_icon_images_fs_event)  # type: ignore[arg-type]
-        self._fs_watcher.fileChanged.connect(self._on_icon_images_fs_event)       # type: ignore[arg-type]
-
-        self._fs_debounce = QtCore.QTimer(self)
-        self._fs_debounce.setSingleShot(True)
-        self._fs_debounce.setInterval(650)
-        self._fs_debounce.timeout.connect(lambda: self._maintenance_request("fs-change"))  # type: ignore[arg-type]
-
+        # Build UI first
         self._build_ui()
         self._apply_theme()
         self._wire()
+        # ---------------- Library root (one-time selection) ----------------
+        root = self._settings.value("library_root", "", str)
+
+        if not root or not Path(root).exists():
+            chosen = choose_library_root(self)
+            if not chosen:
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "IconMaker",
+                    "A library folder is required to continue.",
+                )
+                sys.exit(1)
+
+            self._settings.setValue("library_root", str(chosen))
+            root = str(chosen)
+
+        self.LIBRARY_ROOT = Path(root)
+
+        # Canonical paths
+        global ICON_IMAGES_DIR, ICONS_DIR
+        ICON_IMAGES_DIR = self.LIBRARY_ROOT / "Icon Images"
+        ICONS_DIR = ICON_IMAGES_DIR / "Icons"
+
+        ICON_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+        ICONS_DIR.mkdir(parents=True, exist_ok=True)
+
+        # ---------------- Restore state ----------------
+        last_input = self._settings.value("last_input", "", str)
+        if last_input:
+            self.edit_input.setText(last_input)
+            p = Path(last_input)
+            self.mode_seg.set_mode("folder" if p.is_dir() else "file")
+
+        self.chk_overwrite.setChecked(
+            self._settings.value("last_overwrite", True, bool)
+        )
+        pad = self._settings.value("last_padding", "balanced", str)
+        if self.cmb_padding.findText(pad) >= 0:
+            self.cmb_padding.setCurrentText(pad)
+
+        # ---------------- Persist on change ----------------
+        self.edit_input.textChanged.connect(
+            lambda v: self._settings.setValue("last_input", v)
+        )
+        self.chk_recursive.toggled.connect(
+            lambda b: self._settings.setValue("last_recursive", b)
+        )
+        self.chk_overwrite.toggled.connect(
+            lambda b: self._settings.setValue("last_overwrite", b)
+        )
+        self.cmb_padding.currentTextChanged.connect(
+            lambda t: self._settings.setValue("last_padding", t)
+        )
+        self.mode_seg.modeChanged.connect(
+            lambda m: self._settings.setValue("last_mode", m)
+        )
 
         ensure_tray_running()
         self._log("Ready.")
 
-        # Lock output UI to canonical folder (UI still shown, but deterministic)
         self._lock_output_to_canonical()
-
-        # Arm watcher + run startup maintenance scan (internal-only)
         self._arm_icon_images_watcher()
-        self._maintenance_request("startup")
 
     # -------- UI build --------
     def _build_ui(self) -> None:
@@ -679,25 +774,31 @@ class MainWindow(QtWidgets.QMainWindow):
         sg.addWidget(self.chk_recursive, 2, 0, 1, 2)
 
         # Output (UI preserved; locked to canonical ICONS_DIR)
+        # Output (fixed)
         out = CardFrame("Output")
         left.addWidget(out)
+
         og = QtWidgets.QGridLayout()
         og.setHorizontalSpacing(10)
         og.setVerticalSpacing(10)
         out.body_layout().addLayout(og)
 
-        self.edit_outdir = DropLineEdit()
-        self.edit_outdir.setText(DEFAULT_OUTPUT_DIR)
-        self.btn_out_browse = QtWidgets.QPushButton("Browse…")
-        self.btn_open_out = QtWidgets.QPushButton("Open Output")
-        self.btn_open_images = QtWidgets.QPushButton("Open Icon Images")
-        for b in (self.btn_out_browse, self.btn_open_out, self.btn_open_images):
-            b.setCursor(QtCore.Qt.PointingHandCursor)
+        # Fixed output location (no user-edit, no browse)
+        self.lbl_outdir = QtWidgets.QLabel(str(ICONS_DIR))
+        self.lbl_outdir.setObjectName("FixedOutPath")
+        self.lbl_outdir.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.lbl_outdir.setText(str(ICONS_DIR))
 
-        og.addWidget(self.edit_outdir, 0, 0, 1, 3)
-        og.addWidget(self.btn_out_browse, 0, 3)
-        og.addWidget(self.btn_open_out, 1, 3)
-        og.addWidget(self.btn_open_images, 2, 3)
+        self.btn_open_my_icons = QtWidgets.QPushButton("Open My Icons")
+        self.btn_open_my_icons.setCursor(QtCore.Qt.PointingHandCursor)
+
+        self.btn_open_images = QtWidgets.QPushButton("Open Icon Images")
+        self.btn_open_images.setCursor(QtCore.Qt.PointingHandCursor)
+
+        og.addWidget(QtWidgets.QLabel("My Icons:"), 0, 0)
+        og.addWidget(self.lbl_outdir, 0, 1, 1, 2)
+        og.addWidget(self.btn_open_my_icons, 1, 0, 1, 3)
+        og.addWidget(self.btn_open_images, 2, 0, 1, 3)
 
         # Options
         opt = CardFrame("Icon Quality")
@@ -707,32 +808,36 @@ class MainWindow(QtWidgets.QMainWindow):
         g.setVerticalSpacing(10)
         opt.body_layout().addLayout(g)
 
-        # Default sizes updated per your accepted set
-        self.edit_sizes = QtWidgets.QLineEdit("16,24,32,48,64,128,256,512,1024")
-        self.edit_sizes.setPlaceholderText("16,24,32…")
+        self.cmb_quality = QtWidgets.QComboBox()
+        self.cmb_quality.setCursor(QtCore.Qt.PointingHandCursor)
 
-        self.chk_overwrite = QtWidgets.QCheckBox("Overwrite existing icons")
+        # Presets you requested
+        presets = [
+            "16–1024",
+            "16–512",
+            "16–256",
+            "16–128",
+            "16–64",
+            "16–48",
+            "16–32",
+            "16–24",
+            "16–16",
+        ]
+        self.cmb_quality.addItems(presets)
+        self.cmb_quality.setCurrentText("16–1024")
+
+        self.chk_overwrite = QtWidgets.QCheckBox("Overwrite Mode")
         self.chk_overwrite.setChecked(True)
 
         self.cmb_padding = QtWidgets.QComboBox()
         self.cmb_padding.addItems(list(eng.PADDING_PRESETS.keys()))
         self.cmb_padding.setCurrentText("balanced")
 
-        g.addWidget(QtWidgets.QLabel("Sizes"), 0, 0)
-        g.addWidget(self.edit_sizes, 0, 1, 1, 3)
+        g.addWidget(QtWidgets.QLabel("Quality Preset"), 0, 0)
+        g.addWidget(self.cmb_quality, 0, 1, 1, 3)
         g.addWidget(QtWidgets.QLabel("Padding"), 1, 0)
         g.addWidget(self.cmb_padding, 1, 1)
         g.addWidget(self.chk_overwrite, 1, 2, 1, 2)
-
-        # Library (UI preserved but behavior is now ALWAYS ON)
-        lib = CardFrame("Library")
-        left.addWidget(lib)
-        hl = QtWidgets.QHBoxLayout()
-        lib.body_layout().addLayout(hl)
-
-        self.chk_mirror = QtWidgets.QCheckBox("Mirror inputs into Icon Images library")
-        self.chk_mirror.setChecked(True)
-        hl.addWidget(self.chk_mirror, 1)
 
         left.addStretch(1)
 
@@ -883,15 +988,16 @@ class MainWindow(QtWidgets.QMainWindow):
         """)
 
     def _wire(self) -> None:
-        self.btn_open_out.clicked.connect(lambda: _open_path(self.edit_outdir.text()))  # type: ignore[arg-type]
         self.btn_open_images.clicked.connect(lambda: _open_path(str(ICON_IMAGES_DIR)))  # type: ignore[arg-type]
         self.btn_clear_log.clicked.connect(self._clear_log)  # type: ignore[arg-type]
 
         self.edit_input.pathDropped.connect(self._set_input)  # type: ignore[arg-type]
-        self.edit_outdir.pathDropped.connect(self._set_outdir)  # type: ignore[arg-type]
+
 
         self.btn_browse_input.clicked.connect(self._browse_input)  # type: ignore[arg-type]
-        self.btn_out_browse.clicked.connect(self._browse_outdir)  # type: ignore[arg-type]
+
+        self.btn_open_my_icons.clicked.connect(lambda: _open_path(str(ICONS_DIR)))  # type: ignore[arg-type]
+        self.btn_open_images.clicked.connect(lambda: _open_path(str(ICON_IMAGES_DIR)))  # type: ignore[arg-type]
 
         # Scan removed; Run now does everything
         self.btn_run.clicked.connect(self._run_convert)        # type: ignore[arg-type]
@@ -906,18 +1012,9 @@ class MainWindow(QtWidgets.QMainWindow):
         Output is deterministic: ICONS_DIR.
         We keep the Output card UI (per your requirement) but prevent changing it.
         """
-        self.edit_outdir.setText(str(ICONS_DIR))
-        self.edit_outdir.setReadOnly(True)
-        self.edit_outdir.setEnabled(False)
-        self.btn_out_browse.setEnabled(False)
 
         # Keep "Open Output" and "Open Icon Images" working.
-        self.btn_open_out.setEnabled(True)
         self.btn_open_images.setEnabled(True)
-
-        # Mirror is always on; keep checkbox visible but enforced.
-        self.chk_mirror.setChecked(True)
-        self.chk_mirror.setEnabled(False)
 
     # --------------- basic actions ---------------
     def _set_input(self, p: str) -> None:
@@ -997,7 +1094,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             report = eng.scan_icon_images_and_convert(
                 overwrite=self.chk_overwrite.isChecked(),
-                sizes=eng.parse_sizes(self.edit_sizes.text()),
+                sizes=preset_sizes(self.cmb_quality.currentText()),
                 padding_mode=self.cmb_padding.currentText(),
                 autocrop=False,
                 logfn=lambda s: self._log(s),
@@ -1088,14 +1185,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_cancel.setEnabled(False)
             return
 
-        try:
-            sizes = eng.parse_sizes(self.edit_sizes.text())
-        except Exception as e:
-            self._log(f"ERR: Invalid sizes ({e})", "ERR")
-            self.btn_cancel.setEnabled(False)
-            return
+        sizes = preset_sizes(self.cmb_quality.currentText())
 
-        # enforce ceiling & your accepted ladder
+        # enforce ceiling & accepted ladder
         sizes = [s for s in sizes if 1 <= s <= 1024]
         if not sizes:
             sizes = [16, 24, 32, 48, 64, 128, 256, 512, 1024]
