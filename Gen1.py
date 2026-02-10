@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,6 +55,72 @@ SAGE_BTN_SIZE = 140
 # ---------------- Tray IPC (optional) ----------------
 TRAY_IPC_NAME = "IconMaker_TrayIPC"
 
+def _count_files(root: Path) -> int:
+    n = 0
+    for _dirpath, _dirnames, filenames in os.walk(root):
+        n += len(filenames)
+    return n
+
+
+class LibraryRelocateWorker(QtCore.QObject):
+    """
+    Copies an entire folder tree from src_root -> dst_root.
+    Emits progress without freezing UI.
+    """
+    progress = QtCore.Signal(int, int, str)   # done, total, current_path
+    finished = QtCore.Signal(bool, str)       # ok, message
+
+    def __init__(self, src_root: Path, dst_root: Path):
+        super().__init__()
+        self.src_root = Path(src_root)
+        self.dst_root = Path(dst_root)
+        self._cancel = False
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        try:
+            if not self.src_root.exists():
+                self.finished.emit(False, f"Source root does not exist: {self.src_root}")
+                return
+
+            self.dst_root.mkdir(parents=True, exist_ok=True)
+
+            total = _count_files(self.src_root)
+            done = 0
+
+            for dirpath, dirnames, filenames in os.walk(self.src_root):
+                if self._cancel:
+                    self.finished.emit(False, "Cancelled.")
+                    return
+
+                rel = Path(dirpath).relative_to(self.src_root)
+                target_dir = self.dst_root / rel
+                target_dir.mkdir(parents=True, exist_ok=True)
+
+                for fn in filenames:
+                    if self._cancel:
+                        self.finished.emit(False, "Cancelled.")
+                        return
+
+                    src_file = Path(dirpath) / fn
+                    dst_file = target_dir / fn
+
+                    # Overwrite if exists (we're relocating the canonical library)
+                    try:
+                        shutil.copy2(src_file, dst_file)
+                    except Exception as e:
+                        self.finished.emit(False, f"Copy failed: {src_file} -> {dst_file} ({e})")
+                        return
+
+                    done += 1
+                    self.progress.emit(done, total, str(src_file))
+
+            self.finished.emit(True, "Copy complete.")
+        except Exception as e:
+            self.finished.emit(False, str(e))
+
+    def cancel(self) -> None:
+        self._cancel = True
 
 def _pre_app_setup() -> None:
     """Windows AppUserModelID (helps taskbar grouping and icon association)."""
@@ -534,11 +601,31 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
 
+        # ---------------- Settings (single instance) ----------------
+        self._settings = QtCore.QSettings(APP_ORG, APP_NAME)
+
+        # ---------------- Library root (one-time selection / restore) ----------------
+        root_str = str(self._settings.value("library_root", "") or "").strip()
+        root = Path(root_str) if root_str else None
+
+        if not root or not root.exists():
+            chosen = choose_library_root(self)
+            if not chosen:
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "IconMaker",
+                    "A library folder is required to continue.",
+                )
+                sys.exit(1)
+            self._settings.setValue("library_root", str(chosen))
+            root = chosen
+
+        # Apply canonical paths BEFORE watchers/UI
+        self._set_library_paths(root)
+
         # --- maintenance / watcher state ---
         self._maint_busy = False
         self._maint_pending_reason = None
-
-        self._settings = QtCore.QSettings(APP_ORG, APP_NAME)
 
         self._fs_watcher = QtCore.QFileSystemWatcher(self)
         self._fs_watcher.directoryChanged.connect(self._on_icon_images_fs_event)
@@ -549,15 +636,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._fs_debounce.setInterval(400)
         self._fs_debounce.timeout.connect(lambda: self._maintenance_request("fs-change"))
 
-        # ---------------- Settings ----------------
-        self._settings = QtCore.QSettings(APP_ORG, APP_NAME)
-
         self._app_icon = get_app_icon()
         self.setWindowIcon(self._app_icon)
 
         self.setWindowTitle("IconMaker")
         self.setMinimumSize(1180, 760)
         self.setAcceptDrops(True)
+
 
         self._log_buffer: list[LogLine] = []
         self._log_flush_timer = QtCore.QTimer(self)
@@ -633,6 +718,138 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._lock_output_to_canonical()
         self._arm_icon_images_watcher()
+
+        def _set_library_paths(self, new_root: Path) -> None:
+            """
+            Update canonical library paths after relocation and refresh UI/watcher.
+            """
+            new_root = Path(new_root)
+
+            global ICON_IMAGES_DIR, ICONS_DIR
+            ICON_IMAGES_DIR = new_root / "Icon Images"
+            ICONS_DIR = ICON_IMAGES_DIR / "Icons"
+            ICON_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+            ICONS_DIR.mkdir(parents=True, exist_ok=True)
+
+            # Update UI label if present
+            if hasattr(self, "lbl_outdir"):
+                self.lbl_outdir.setText(str(ICONS_DIR))
+
+            # Re-arm watcher if you have one
+            if hasattr(self, "_fs_watcher") and hasattr(self, "_arm_icon_images_watcher"):
+                try:
+                    self._arm_icon_images_watcher()
+                except Exception:
+                    pass
+
+        def _change_library_location(self) -> None:
+            """
+            Copy current library root to a new location, then (optionally) delete old root.
+            Updates QSettings on success.
+            """
+            # Current root is the parent of "Icon Images"
+            try:
+                old_root = Path(ICON_IMAGES_DIR).parent
+            except Exception:
+                old_root = None
+
+            start_dir = str(old_root) if old_root and old_root.exists() else QtCore.QDir.homePath()
+            picked = QtWidgets.QFileDialog.getExistingDirectory(
+                self,
+                "Choose NEW IconMaker Library Location",
+                start_dir,
+            )
+            if not picked:
+                return
+
+            new_root = Path(picked).resolve()
+            if old_root and new_root == old_root.resolve():
+                self._log("Library location unchanged.", "WARN")
+                return
+
+            # Destination root must be empty or you accept merge/overwrite
+            # We will create: <new_root>/Icon Images/...
+            dst_icon_images = new_root / "Icon Images"
+            if dst_icon_images.exists():
+                r = QtWidgets.QMessageBox.question(
+                    self,
+                    "IconMaker",
+                    "This location already contains an 'Icon Images' folder.\n\n"
+                    "Proceed and OVERWRITE files where needed?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No,
+                )
+                if r != QtWidgets.QMessageBox.Yes:
+                    return
+
+            # Prepare background copy worker
+            src = old_root if old_root else Path(ICON_IMAGES_DIR).parent
+            dst = new_root
+
+            dlg = QtWidgets.QProgressDialog("Relocating library…", "Cancel", 0, 100, self)
+            dlg.setWindowTitle("IconMaker")
+            dlg.setWindowModality(QtCore.Qt.WindowModal)
+            dlg.setAutoClose(False)
+            dlg.setAutoReset(False)
+            dlg.show()
+
+            thread = QtCore.QThread(self)
+            worker = LibraryRelocateWorker(src, dst)
+            worker.moveToThread(thread)
+
+            def on_progress(done: int, total: int, current: str) -> None:
+                if total <= 0:
+                    dlg.setValue(0)
+                    return
+                pct = int(done * 100 / total)
+                dlg.setValue(max(0, min(100, pct)))
+                dlg.setLabelText(f"Copying… ({done}/{total})\n{current}")
+
+            def on_cancel() -> None:
+                worker.cancel()
+
+            def on_finished(ok: bool, msg: str) -> None:
+                thread.quit()
+                thread.wait(1500)
+                dlg.close()
+
+                if not ok:
+                    self._log(f"Library relocate failed: {msg}", "ERR")
+                    QtWidgets.QMessageBox.critical(self, "IconMaker", f"Relocate failed:\n{msg}")
+                    return
+
+                # Update settings + globals
+                self._settings.setValue("library_root", str(new_root))
+                self._set_library_paths(new_root)
+
+                self._log(f"Library relocated to: {new_root}")
+
+                # Offer to delete old root (turn copy into MOVE)
+                r = QtWidgets.QMessageBox.question(
+                    self,
+                    "IconMaker",
+                    "Copy complete.\n\nDelete the OLD library folder to finish the move?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.Yes,
+                )
+                if r == QtWidgets.QMessageBox.Yes and old_root and old_root.exists():
+                    try:
+                        shutil.rmtree(old_root)
+                        self._log(f"Old library deleted: {old_root}")
+                    except Exception as e:
+                        self._log(f"WARN: Could not delete old library ({e})", "WARN")
+                        QtWidgets.QMessageBox.warning(
+                            self,
+                            "IconMaker",
+                            f"New library is active, but old folder could not be deleted:\n{e}",
+                        )
+
+            worker.progress.connect(on_progress)  # type: ignore[arg-type]
+            worker.finished.connect(on_finished)  # type: ignore[arg-type]
+            dlg.canceled.connect(on_cancel)  # type: ignore[arg-type]
+
+            thread.started.connect(worker.run)  # type: ignore[arg-type]
+            thread.start()
 
     # -------- UI build --------
     def _build_ui(self) -> None:
@@ -773,7 +990,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_recursive = QtWidgets.QCheckBox("Recursive (subfolders)")
         sg.addWidget(self.chk_recursive, 2, 0, 1, 2)
 
-        # Output (UI preserved; locked to canonical ICONS_DIR)
         # Output (fixed)
         out = CardFrame("Output")
         left.addWidget(out)
@@ -787,7 +1003,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_outdir = QtWidgets.QLabel(str(ICONS_DIR))
         self.lbl_outdir.setObjectName("FixedOutPath")
         self.lbl_outdir.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        self.lbl_outdir.setText(str(ICONS_DIR))
 
         self.btn_open_my_icons = QtWidgets.QPushButton("Open My Icons")
         self.btn_open_my_icons.setCursor(QtCore.Qt.PointingHandCursor)
@@ -795,10 +1010,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_open_images = QtWidgets.QPushButton("Open Icon Images")
         self.btn_open_images.setCursor(QtCore.Qt.PointingHandCursor)
 
-        og.addWidget(QtWidgets.QLabel("My Icons:"), 0, 0)
+        self.btn_change_library = QtWidgets.QPushButton("Change Library Location…")
+        self.btn_change_library.setCursor(QtCore.Qt.PointingHandCursor)
+
+        self.btn_open_my_icons.clicked.connect(lambda: _open_path(str(ICONS_DIR)))  # type: ignore[arg-type]
+        self.btn_open_images.clicked.connect(lambda: _open_path(str(ICON_IMAGES_DIR)))  # type: ignore[arg-type]
+        self.btn_change_library.clicked.connect(self._change_library_location)  # type: ignore[arg-type]
+
+        og.addWidget(QtWidgets.QLabel("Icon Output"), 0, 0)
         og.addWidget(self.lbl_outdir, 0, 1, 1, 2)
         og.addWidget(self.btn_open_my_icons, 1, 0, 1, 3)
         og.addWidget(self.btn_open_images, 2, 0, 1, 3)
+        og.addWidget(self.btn_change_library, 3, 0, 1, 3)
 
         # Options
         opt = CardFrame("Icon Quality")
