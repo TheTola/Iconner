@@ -3,7 +3,7 @@
 #
 # Goals:
 # - Clean, predictable folder layout
-# - Robust image scan + conversion (PNG/JPG/WEBP/BMP/TIFF + SVG via CairoSVG)
+# - Robust image scan + conversion (PNG/JPG/WEBP/TIFF/BMP + SVG via CairoSVG)
 # - Multi-size .ico generation that does NOT "stick" to 16x16:
 #     - Always saves from a LARGE base frame
 #     - Embeds all requested sizes via Pillow's ICO writer
@@ -13,26 +13,14 @@
 #     - If caller mistakenly passes a *.ico file path where an output directory is expected,
 #       we treat it as an explicit output file path and do NOT create a folder named "*.ico".
 #
-# NOTE (Windows reality):
-# - Windows shell generally *uses* up to 256x256 for icons.
-# - You *can* embed sizes above 256 in an ICO, but Windows may ignore them.
-# - If you want true 1024 quality in real usage, export a separate 1024 PNG too.
+# Note:
+# - Windows typically uses up to 256x256 for icons in Explorer UI.
+# - Larger frames may be embedded but ignored by some shell contexts.
 #
-# Updated for: 8..1024 sizes, safer out paths, better ICO save behavior, clearer diagnostics.
-#
-# NEW (Progress callbacks):
-# - scan_icon_images_and_convert() now supports progress_cb per-image
-# - convert_many() supports progress_cb per-image
-#   Signature: progress_cb(phase: str, index: int, total: int, path: Optional[Path]) -> None
-#
-#   phase values (by convention):
-#     - "normalize"   (0/1 markers)
-#     - "orphans"     (0/1 markers)
-#     - "scan"        (enumerating / filtering)
-#     - "convert"     (per-image conversion)
-#     - "done"        (0/1 markers)
-#
-# This makes the UI progress bar non-cosmetic without rewriting the engine.
+# This version:
+# - Integrates strict library collision policy via Gen_name.py
+# - Removes Gen2-owned canonical naming/sanitization (moved to Gen_name)
+# - Gen2 remains the engine source-of-truth for conversion/scan/orphans/diagnostics
 
 from __future__ import annotations
 
@@ -43,9 +31,16 @@ import sys
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple, Dict
 
 from PIL import Image, UnidentifiedImageError
+
+# Canonical naming + strict collision policy (Gen4 helpers)
+from Gen_name import (
+    copy_into_library_strict,
+    move_into_library_strict,
+    flatten_name_from_subfolder,
+)
 
 __all__ = [
     "IMAGE_EXTS",
@@ -57,11 +52,11 @@ __all__ = [
     "DEFAULT_OUTPUT_DIR",
     "PADDING_PRESETS",
     "ScanReport",
+    "ImageDiscoveryReport",
+    "diagnose_image_discovery",
     "parse_sizes",
     "find_images",
     "make_ico",
-    "sanitize_piece",
-    "closest_folder_named_filename",
     "unique_path",
     "normalize_icon_images_library",
     "mirror_copy_to_icon_images",
@@ -101,6 +96,161 @@ ProgressCB = Callable[[str, int, int, Optional[Path]], None]
 
 
 # =========================
+# Image discovery diagnostics (production-grade error reporting)
+# =========================
+
+@dataclass(frozen=True)
+class ImageDiscoveryReport:
+    """
+    Diagnose WHY a given input produced zero convertible images.
+
+    This is intentionally filesystem-level and discovery-level. It explains:
+      - path does not exist
+      - file selected but unsupported extension
+      - folder empty
+      - folder has files but none supported
+      - images exist only in subfolders while recursive is off
+    """
+    input_path: Path
+    exists: bool
+    is_file: bool
+    is_dir: bool
+    recursive_requested: bool
+
+    # Counts
+    supported_found: int
+    supported_found_nonrecursive: int
+    supported_found_recursive: int
+    total_files_nonrecursive: int
+    total_files_recursive: int
+
+    # Evidence
+    unsupported_ext_counts: Dict[str, int]
+    unreadable_errors: List[str]
+
+    def to_lines(self) -> List[str]:
+        p = self.input_path
+        lines: List[str] = []
+
+        if not self.exists:
+            lines.append("Cause: Input path does not exist.")
+            return lines
+
+        if self.is_file:
+            ext = p.suffix.lower()
+            if ext not in IMAGE_EXTS:
+                lines.append("Cause: Input is a file, but its extension is not supported.")
+                lines.append(f"Details: got '{ext or '(no extension)'}'; supported: {sorted(IMAGE_EXTS)}")
+            else:
+                lines.append("Cause: Input is a supported image type but was not accepted as a valid file.")
+                lines.append("Details: file exists, but could not be treated as a supported image.")
+            return lines
+
+        if self.is_dir:
+            if self.total_files_recursive == 0:
+                lines.append("Cause: Folder is empty (no files found).")
+                return lines
+
+            if self.supported_found_recursive == 0:
+                lines.append("Cause: Folder contains files, but none are supported image types.")
+                if self.unsupported_ext_counts:
+                    top = sorted(self.unsupported_ext_counts.items(), key=lambda kv: kv[1], reverse=True)[:8]
+                    lines.append("Details: top extensions seen: " + ", ".join([f"{k}×{v}" for k, v in top]))
+                lines.append(f"Supported: {sorted(IMAGE_EXTS)}")
+                return lines
+
+            if not self.recursive_requested and self.supported_found_nonrecursive == 0:
+                lines.append("Cause: Images exist in subfolders, but Recursive is OFF.")
+                lines.append(f"Details: supported images (recursive): {self.supported_found_recursive}")
+                lines.append("Fix: enable Recursive, or select the specific subfolder that contains the images.")
+                return lines
+
+            lines.append("Cause: Supported images exist, but none were selected for conversion.")
+            lines.append(f"Details: supported (this mode): {self.supported_found}")
+            if self.unreadable_errors:
+                lines.append("Also saw errors while scanning:")
+                lines.extend([f"  - {e}" for e in self.unreadable_errors[:5]])
+            return lines
+
+        lines.append("Cause: Input is neither a file nor a directory.")
+        return lines
+
+
+def diagnose_image_discovery(input_path: Path, *, recursive: bool) -> ImageDiscoveryReport:
+    """
+    Produce an ImageDiscoveryReport for the given input path.
+
+    Important behavior:
+      - If input is a folder, we ALWAYS do a recursive scan for DIAGNOSIS even when recursive=False,
+        so we can explicitly report: "Images exist in subfolders, but recursive is off."
+    """
+    p = Path(input_path)
+    exists = p.exists()
+    is_file = exists and p.is_file()
+    is_dir = exists and p.is_dir()
+
+    unsupported_ext_counts: Dict[str, int] = {}
+    unreadable_errors: List[str] = []
+
+    supported_found_nonrec = 0
+    total_files_nonrec = 0
+
+    supported_found_rec = 0
+    total_files_rec = 0
+
+    if is_dir:
+        # Non-recursive scan (top-level only)
+        try:
+            for child in p.iterdir():
+                if child.is_file():
+                    total_files_nonrec += 1
+                    ext = child.suffix.lower()
+                    if ext in IMAGE_EXTS:
+                        supported_found_nonrec += 1
+                    else:
+                        key = ext or "(no ext)"
+                        unsupported_ext_counts[key] = unsupported_ext_counts.get(key, 0) + 1
+        except Exception as e:
+            unreadable_errors.append(f"Top-level scan failed: {type(e).__name__}: {e}")
+
+        # Recursive scan (full tree)
+        try:
+            for child in p.rglob("*"):
+                if child.is_file():
+                    total_files_rec += 1
+                    ext = child.suffix.lower()
+                    if ext in IMAGE_EXTS:
+                        supported_found_rec += 1
+                    else:
+                        key = ext or "(no ext)"
+                        unsupported_ext_counts[key] = unsupported_ext_counts.get(key, 0) + 1
+        except Exception as e:
+            unreadable_errors.append(f"Recursive scan failed: {type(e).__name__}: {e}")
+
+    if is_file:
+        ext = p.suffix.lower()
+        if ext not in IMAGE_EXTS:
+            unsupported_ext_counts[ext or "(no ext)"] = 1
+
+    supported_found = supported_found_rec if recursive else supported_found_nonrec
+
+    return ImageDiscoveryReport(
+        input_path=p,
+        exists=exists,
+        is_file=is_file,
+        is_dir=is_dir,
+        recursive_requested=bool(recursive),
+        supported_found=int(supported_found),
+        supported_found_nonrecursive=int(supported_found_nonrec),
+        supported_found_recursive=int(supported_found_rec),
+        total_files_nonrecursive=int(total_files_nonrec),
+        total_files_recursive=int(total_files_rec),
+        unsupported_ext_counts=unsupported_ext_counts,
+        unreadable_errors=unreadable_errors,
+    )
+
+
+# =========================
 # Small utilities
 # =========================
 
@@ -129,36 +279,14 @@ def parse_sizes(s: Optional[str]) -> Optional[List[int]]:
     return out or None
 
 
-def sanitize_piece(s: str) -> str:
-    """Make a safe filename-ish component."""
-    bad = '<>:"/\\|?*'
-    out = "".join("_" if c in bad else c for c in s)
-    out = out.strip().strip(".")
-    return out or "untitled"
-
-
-def closest_folder_named_filename(p: Path) -> str:
-    """
-    If p is nested under Icon Images subfolders, create a flattened name:
-      SomeFolder__file.png
-    If already in root, keep file name.
-    """
-    try:
-        rel = p.relative_to(ICON_IMAGES_DIR)
-    except Exception:
-        return p.name
-
-    parts = list(rel.parts)
-    if len(parts) <= 1:
-        return p.name
-
-    folder = sanitize_piece(parts[0])
-    fname = sanitize_piece(p.stem) + p.suffix.lower()
-    return f"{folder}__{fname}"
-
-
 def unique_path(p: Path) -> Path:
-    """Return a non-colliding path by adding ' (2)', ' (3)', ... if needed."""
+    """
+    Return a non-colliding path by adding ' (2)', ' (3)', ... if needed.
+
+    IMPORTANT:
+      - This must NEVER be used to create alternate names inside ICON_IMAGES_DIR.
+      - It is valid ONLY for quarantine buckets (e.g., Icons/_Orphans).
+    """
     if not p.exists():
         return p
     stem = p.stem
@@ -291,6 +419,12 @@ def _resolve_output_target(
     src: Path,
     suffix: str = "",
 ) -> Tuple[Path, Path]:
+    """
+    Defensive output handling:
+
+    If outdir_or_file ends with ".ico", treat it as an explicit output file path.
+    Otherwise treat it as an output directory, and create "<src.stem><suffix>.ico" inside it.
+    """
     p = Path(outdir_or_file)
 
     if p.suffix.lower() == ".ico":
@@ -383,7 +517,10 @@ def make_ico(
 
         base.save(out_path, format="ICO", sizes=[(s, s) for s in sizes_to_use])
 
-        msg = f"OK: {src.name} -> {out_path.name} sizes={sizes_to_use[0]}..{sizes_to_use[-1]} ({len(sizes_to_use)} frames)"
+        msg = (
+            f"OK: {src.name} -> {out_path.name} "
+            f"sizes={sizes_to_use[0]}..{sizes_to_use[-1]} ({len(sizes_to_use)} frames)"
+        )
         if logfn:
             logfn(msg)
         return True, msg
@@ -392,78 +529,81 @@ def make_ico(
 
 
 # =========================
-# Library normalization
+# Library normalization (STRICT, NO DUPLICATES)
 # =========================
 
 def normalize_icon_images_library(logfn: Callable[[str], None] | None = None) -> int:
     """
-    Flatten nested files into ICON_IMAGES_DIR root WITHOUT creating duplicates.
+    Flatten nested image files into ICON_IMAGES_DIR root WITHOUT ever creating duplicates.
 
-    Rule:
-      - If the target filename already exists in ICON_IMAGES_DIR, DO NOT move and DO NOT rename.
-      - Never create ' (2)' variants.
-      - Leave the conflicting file where it is (and log).
+    Collision policy (hard rule):
+      - Canonical destination name is computed first (case-insensitive + Unicode stable).
+      - If that canonical name already exists in ICON_IMAGES_DIR:
+          * SKIP the move
+          * Log a warning
+          * Do NOT rename, suffix, or create variants
+
+    Implementation:
+      - Delegates strict naming + collision enforcement to Gen_name.move_into_library_strict()
     """
     if not ICON_IMAGES_DIR.exists():
         return 0
 
     moved = 0
+
     for p in ICON_IMAGES_DIR.rglob("*"):
         if not _is_image_file(p):
             continue
         if p.parent == ICON_IMAGES_DIR:
             continue
 
-        new_name = closest_folder_named_filename(p)
-        dst = ICON_IMAGES_DIR / new_name
-
-        if dst.exists():
-            if logfn:
-                logfn(f"Normalize: SKIP (name collision): {p} -> {dst.name}")
-            continue
-
         try:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            p.replace(dst)
+            rel = p.relative_to(ICON_IMAGES_DIR)
+            desired = flatten_name_from_subfolder(tuple(rel.parts))
+        except Exception:
+            desired = p.name
+
+        dst, collision = move_into_library_strict(
+            p,
+            ICON_IMAGES_DIR,
+            desired_name=desired,
+            allowed_exts=IMAGE_EXTS,
+            is_accepted_file=_is_image_file,
+            logfn=logfn,
+        )
+
+        if dst is not None and collision is None:
             moved += 1
-        except Exception as e:
-            if logfn:
-                logfn(f"Normalize: FAILED {p} -> {dst}: {e}")
 
     if moved and logfn:
         logfn(f"Normalize: moved {moved} file(s) into root.")
     return moved
 
+
 def mirror_copy_to_icon_images(src: Path, logfn: Callable[[str], None] | None = None) -> Optional[Path]:
     """
-    COPY src into ICON_IMAGES_DIR (canonical library) without ever creating duplicates.
+    COPY src into ICON_IMAGES_DIR (the canonical library) with strict collision rules.
 
-    Rule:
-      - If the destination name already exists in ICON_IMAGES_DIR, SKIP the copy.
-      - Never create ' (2)', ' (3)' variants.
+    Hard rule:
+      - The system must never create duplicate images in the library.
+
+    Collision policy:
+      - If the incoming file resolves to a canonical name that already exists in ICON_IMAGES_DIR,
+        we SKIP the copy and return the existing canonical file path.
+      - No suffixing. No renaming. No variant generation.
+
+    Implementation:
+      - Delegates canonical naming + collision enforcement to Gen_name.copy_into_library_strict()
     """
-    src = Path(src)
-    if not src.exists() or not src.is_file():
-        return None
+    dst, _collision = copy_into_library_strict(
+        Path(src),
+        ICON_IMAGES_DIR,
+        allowed_exts=IMAGE_EXTS,
+        is_accepted_file=_is_image_file,
+        logfn=logfn,
+    )
+    return dst
 
-    ICON_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-
-    dst = ICON_IMAGES_DIR / sanitize_piece(src.name)
-
-    if dst.exists():
-        if logfn:
-            logfn(f"Mirror: SKIP (already exists): {dst.name}")
-        return dst  # treat as success: the library already has it
-
-    try:
-        shutil.copy2(src, dst)
-        if logfn:
-            logfn(f"Mirror: COPIED {src.name} -> {dst.name}")
-        return dst
-    except Exception as e:
-        if logfn:
-            logfn(f"Mirror: FAILED {src} -> {dst}: {e}")
-        return None
 
 # =========================
 # Orphan cleanup
@@ -582,6 +722,9 @@ def convert_many(
     skip_if_ico_exists:
       - If True and the target .ico already exists, SKIP conversion for that image.
       - This is stronger than overwrite=False and is intended for maintenance runs.
+
+    progress_cb signature:
+      progress_cb(phase: str, index: int, total: int, path: Optional[Path]) -> None
     """
     imgs: List[Path] = []
     for img in images:
@@ -605,7 +748,6 @@ def convert_many(
             except Exception:
                 pass
 
-        # Hard skip rule for maintenance: if ico exists, do nothing
         if skip_if_ico_exists:
             ico_path = outdir / f"{img.stem}{suffix}.ico"
             if ico_path.exists():
@@ -635,7 +777,6 @@ def convert_many(
     return scanned, converted, errors
 
 
-
 @dataclass(frozen=True)
 class ScanReport:
     scanned: int
@@ -661,13 +802,13 @@ def scan_icon_images_and_convert(
     """
     High-level "library scan":
 
-    1) Normalize Icon Images library (flatten subfolders into root).
+    1) Normalize Icon Images library (flatten subfolders into root; strict no-duplicate policy).
     2) Remove orphan .ico in Icons folder (rename-safe).
     3) Convert each root-level image into Icons/<stem>.ico (multi-size).
 
     Progress:
       - normalize/orphans as 0/1 markers
-      - convert is per-image real progress
+      - convert is per-image progress
     """
     if progress_cb:
         try:
@@ -705,7 +846,6 @@ def scan_icon_images_and_convert(
             except Exception:
                 pass
 
-    # Convert root-level library images
     if progress_cb:
         try:
             progress_cb("scan", 0, 1, None)
@@ -732,7 +872,7 @@ def scan_icon_images_and_convert(
         logfn=logfn,
         progress_cb=progress_cb,
         progress_phase="convert",
-        skip_if_ico_exists=True,  # <-- ENFORCE: if ico exists, skip
+        skip_if_ico_exists=True,
     )
 
     if logfn:
